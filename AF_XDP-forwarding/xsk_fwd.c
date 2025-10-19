@@ -758,7 +758,7 @@ static const struct bpool_params bpool_params_default = {
     .buffer_size = XSK_UMEM__DEFAULT_FRAME_SIZE,
     .mmap_flags = MAP_HUGETLB,
 
-    .n_users_max = 16,
+    .n_users_max = 32,
     .n_buffers_per_slab = XSK_RING_PROD__DEFAULT_NUM_DESCS * 2,
 };
 
