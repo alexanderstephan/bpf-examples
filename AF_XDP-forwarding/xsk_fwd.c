@@ -272,7 +272,7 @@ bcache_init(struct bpool *bp)
     bc->n_buffers_prod = 0;
 
     pthread_mutex_lock(&bp->lock);
-    if (bp->n_slabs_reserved_available < 2) {
+    if (bp->n_slabs_reserved_available == 0) {
         pthread_mutex_unlock(&bp->lock);
         free(bc);
         return NULL;
@@ -298,27 +298,32 @@ bcache_free(struct bcache *bc)
 	bp = bc->bp;
 	pthread_mutex_lock(&bp->lock);
 
-	/* This function's goal is to return all buffers and slabs from the
-	 * cache back to the pool. The logic is complex because the pool is
-	 * designed to trade only full or empty slabs. The original code
-	 * had a bug that could cause memory corruption when consolidating
-	 * buffers.
-	 *
-	 * A simple, safe approach is to just return the slabs to the reserved
-	 * pool, effectively leaking the buffers they contain. For a sample
-	 * application that is short-lived, this is acceptable to avoid
-	 * complex and potentially buggy cleanup code.
-	 */
+	// 1. Consolidate unused buffers from the consumer slab into the producer slab.
+	for (i = 0; i < bc->n_buffers_cons; i++) {
+		// If the producer slab becomes full, return it to the main pool
+		if (bc->n_buffers_prod == bp->params.n_buffers_per_slab) {
+			bp->slabs[bp->n_slabs_available++] = bc->slab_prod;
+			// The original consumer slab is now our new empty producer slab
+			bc->slab_prod = bc->slab_cons; 
+			bc->n_buffers_prod = 0;
+		}
 
-	if (bc->slab_prod)
-		bp->slabs_reserved[bp->n_slabs_reserved_available++] = bc->slab_prod;
-	if (bc->slab_cons)
-		bp->slabs_reserved[bp->n_slabs_reserved_available++] = bc->slab_cons;
+		bc->slab_prod[bc->n_buffers_prod++] = bc->slab_cons[i];
+	}
+
+	// 2. Return the final (potentially partially-full) producer slab.
+	if (bc->n_buffers_prod > 0) {
+		bp->slabs[bp->n_slabs_available++] = bc->slab_prod;
+	}
+
+	// 3. The original consumer slab is now either empty or has been repurposed.
+	// We can just mark it as available for reservation.
+	bp->slabs_reserved[bp->n_slabs_reserved_available++] = bc->slab_cons;
+
 
 	pthread_mutex_unlock(&bp->lock);
 	free(bc);
 }
-
 
 /* To work correctly, the implementation requires that the *n_buffers* input
  * argument is never greater than the buffer pool's *n_buffers_per_slab*. This
@@ -472,23 +477,23 @@ static int batch_size = DEFAULT_BATCH_SIZE;
  */
 static void drain_umem_cq(struct port *p)
 {
-    u32 n_pkts, pos, i;
+	u32 n_pkts, pos, i;
 
-    /* Keep checking the CQ in a loop until it is completely empty. */
-    while (true) {
-        n_pkts = xsk_ring_cons__peek(&p->umem_cq,
-                         p->params.bp->umem_cfg.comp_size, &pos);
-        if (n_pkts == 0)
-            break; /* Exit the loop when the queue is empty */
+	/* Keep checking the CQ in a loop until it is completely empty. */
+	while (true) {
+		n_pkts = xsk_ring_cons__peek(&p->umem_cq,
+					     p->params.bp->umem_cfg.comp_size, &pos);
+		if (n_pkts == 0)
+			break; /* Exit the loop when the queue is empty */
 
-        /* Return each freed buffer address to the local buffer cache. */
-        for (i = 0; i < n_pkts; i++) {
-            u64 addr = *xsk_ring_cons__comp_addr(&p->umem_cq, pos + i);
-            bcache_prod(p->bc, addr);
-        }
+		/* Return each freed buffer address to the local buffer cache. */
+		for (i = 0; i < n_pkts; i++) {
+			u64 addr = *xsk_ring_cons__comp_addr(&p->umem_cq, pos + i);
+			bcache_prod(p->bc, addr);
+		}
 
-        xsk_ring_cons__release(&p->umem_cq, n_pkts);
-    }
+		xsk_ring_cons__release(&p->umem_cq, n_pkts);
+	}
 }
 
 static void
@@ -710,7 +715,7 @@ thread_func(void *arg)
     CPU_SET(t->cpu_core_id, &cpu_cores);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpu_cores);
 
-    for (i = 0; !t->quit; i = (i + 1) % (t->n_ports_rx ? t->n_ports_rx : 1)) {
+    for (i = 0; !t->quit; i = (i + 1) & (t->n_ports_rx - 1)) {
         struct port *port_rx = t->ports_rx[i];
         struct port *port_tx = t->ports_tx[i];
         struct burst_rx *brx = &t->burst_rx;
@@ -806,42 +811,36 @@ static pthread_t threads[MAX_THREADS];
 static struct thread_data thread_data[MAX_THREADS];
 static int n_threads;
 
-static int stats_interval_sec = 1;
-
 static void
 print_usage(char *prog_name)
 {
     const char *usage =
         "Usage:\n"
-        "\t%s [ OPTIONS ] -c CORE -i INTERFACE [ -q QUEUE ]\n"
-        "\n"
-        "OPTIONS:\n"
-        "-b SIZE        Number of buffers in the buffer pool shared\n"
-        "               by all the forwarding threads. Default: %u.\n"
+        "\t%s [ -b SIZE ] [ -s SIZE ] -c CORE -i INTERFACE [ -q QUEUE ]\n"
         "\n"
         "-c CORE        CPU core to run a packet forwarding thread\n"
         "               on. May be invoked multiple times.\n"
+        "\n"
+        "-b SIZE        Number of buffers in the buffer pool shared\n"
+        "               by all the forwarding threads. Default: %u.\n"
+        "\n"
+        "-s SIZE        Batch size for RX and TX. Default: %d. Max: %d.\n"
         "\n"
         "-i INTERFACE   Network interface. Each (INTERFACE, QUEUE)\n"
         "               pair specifies one forwarding port. May be\n"
         "               invoked multiple times.\n"
         "\n"
         "-q QUEUE       Network interface queue for RX and TX. Each\n"
-        "               (INTERFACE, QUEUE) pair specifies one\n"
+        "               (INTERFACE, QUEUE) pair specified one\n"
         "               forwarding port. Default: %u. May be invoked\n"
         "               multiple times.\n"
-        "\n"
-        "-s SIZE        Batch size for RX and TX. Default: %d. Max: %d.\n"
-        "\n"
-        "-t SECONDS     Statistics print interval in seconds.\n"
-        "               Set to 0 to disable. Default: 1.\n"
         "\n";
     printf(usage,
            prog_name,
            bpool_params_default.n_buffers,
-           port_params_default.iface_queue,
            DEFAULT_BATCH_SIZE,
-           MAX_BURST_RX);
+           MAX_BURST_RX,
+           port_params_default.iface_queue);
 }
 
 static int
@@ -854,7 +853,7 @@ parse_args(int argc, char **argv)
 
     /* Parse the input arguments. */
     for ( ; ;) {
-        opt = getopt_long(argc, argv, "b:c:i:q:s:t:", lgopts, &option_index);
+        opt = getopt_long(argc, argv, "b:c:i:q:s:", lgopts, &option_index);
         if (opt == EOF)
             break;
 
@@ -868,14 +867,6 @@ parse_args(int argc, char **argv)
             if (batch_size <= 0 || batch_size > MAX_BURST_RX) {
                 printf("Invalid batch size. Must be 1..%d\n",
                        MAX_BURST_RX);
-                return -1;
-            }
-            break;
-        
-        case 't':
-            stats_interval_sec = atoi(optarg);
-            if (stats_interval_sec < 0) {
-                printf("Invalid statistics interval.\n");
                 return -1;
             }
             break;
@@ -1032,7 +1023,7 @@ print_port_stats_all(u64 ns_diff)
     print_port_stats_trailer();
 }
 
-static volatile int quit;
+static int quit;
 
 static void
 signal_handler(int sig)
@@ -1061,7 +1052,7 @@ static void remove_xdp_program(void)
 int main(int argc, char **argv)
 {
     struct timespec time;
-    u64 ns0 = 0;
+    u64 ns0;
     int i;
 
     /* Parse args. */
@@ -1086,6 +1077,8 @@ int main(int argc, char **argv)
     }
     printf("Buffer pool created successfully.\n");
 
+    printf("DEBUG: [START] Available Buffers = %llu\n",
+       bp->n_slabs_available * bp->params.n_buffers_per_slab);
     /* Ports initialization. */
     for (i = 0; i < MAX_PORTS; i++)
         port_params[i].bp = bp;
@@ -1106,8 +1099,7 @@ int main(int argc, char **argv)
         u32 n_ports_per_thread = n_ports / n_threads, j;
 
         for (j = 0; j < n_ports_per_thread; j++) {
-            u32 port_idx = i * n_ports_per_thread + j;
-            t->ports_rx[j] = ports[port_idx];
+            t->ports_rx[j] = ports[i * n_ports_per_thread + j];
             t->ports_tx[j] = ports[i * n_ports_per_thread +
                 (j + 1) % n_ports_per_thread];
         }
@@ -1136,49 +1128,45 @@ int main(int argc, char **argv)
     signal(SIGTERM, signal_handler);
     signal(SIGABRT, signal_handler);
 
-    if (stats_interval_sec > 0) {
-        clock_gettime(CLOCK_MONOTONIC, &time);
-        ns0 = time.tv_sec * 1000000000UL + time.tv_nsec;
+    // clock_gettime(CLOCK_MONOTONIC, &time);
+    // ns0 = time.tv_sec * 1000000000UL + time.tv_nsec;
+    for ( ; !quit; ) {
+    //     u64 ns1, ns_diff;
 
-        while (!quit) {
-            sleep(stats_interval_sec);
-            if (quit)
-                break;
+         usleep(50000);
+    //     clock_gettime(CLOCK_MONOTONIC, &time);
+    //     ns1 = time.tv_sec * 1000000000UL + time.tv_nsec;
+    //     ns_diff = ns1 - ns0;
+    //     ns0 = ns1;
 
-            u64 ns1, ns_diff;
-
-            clock_gettime(CLOCK_MONOTONIC, &time);
-            ns1 = time.tv_sec * 1000000000UL + time.tv_nsec;
-            ns_diff = ns1 - ns0;
-            ns0 = ns1;
-
-            print_port_stats_all(ns_diff);
-        }
-    } else {
-        /* Stats disabled, just wait for a signal to quit. */
-        while (!quit)
-            pause();
+    //     print_port_stats_all(ns_diff);
     }
 
     /* Threads completion. */
-    printf("Quitting...\n");
+    printf("Quit.\n");
     for (i = 0; i < n_threads; i++)
         thread_data[i].quit = 1;
 
+    printf("Set quit.\n");
+
     for (i = 0; i < n_threads; i++)
         pthread_join(threads[i], NULL);
-    printf("All threads have been joined.\n");
+
+    printf("Waiting to join threads.\n");
 
     for (i = 0; i < n_ports; i++)
         port_free(ports[i]);
-    printf("All ports have been freed.\n");
+
+    printf("Freed ports.\n");
+
+    printf("DEBUG: [END] Available Buffers = %llu\n",
+       bp->n_slabs_available * bp->params.n_buffers_per_slab);
 
     bpool_free(bp);
-    printf("Buffer pool has been freed.\n");
 
     remove_xdp_program();
 
-    /* Give stdout some time to flush */
+    // give stdout some time
     sleep(1);
     return 0;
 }
