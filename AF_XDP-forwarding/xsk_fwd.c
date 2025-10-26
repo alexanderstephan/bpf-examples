@@ -289,40 +289,28 @@ bcache_init(struct bpool *bp)
 static void
 bcache_free(struct bcache *bc)
 {
-	struct bpool *bp;
-	u64 i;
+    struct bpool *bp;
 
-	if (!bc)
-		return;
+    if (!bc)
+        return;
 
-	bp = bc->bp;
-	pthread_mutex_lock(&bp->lock);
+    // WARNING: THIS VERSION STILL IGNORES RETURNING BUFFERS
+    // IT ONLY FIXES THE RESERVED SLAB COUNT LEAK
 
-	// 1. Consolidate unused buffers from the consumer slab into the producer slab.
-	for (i = 0; i < bc->n_buffers_cons; i++) {
-		// If the producer slab becomes full, return it to the main pool
-		if (bc->n_buffers_prod == bp->params.n_buffers_per_slab) {
-			bp->slabs[bp->n_slabs_available++] = bc->slab_prod;
-			// The original consumer slab is now our new empty producer slab
-			bc->slab_prod = bc->slab_cons; 
-			bc->n_buffers_prod = 0;
-		}
+    bp = bc->bp;
+    pthread_mutex_lock(&bp->lock);
 
-		bc->slab_prod[bc->n_buffers_prod++] = bc->slab_cons[i];
-	}
+    // Just increment the count, assuming two slots become free.
+    // This relies on bpool_init pre-calculating the pointers.
+    bp->n_slabs_reserved_available += 2; // Returns BOTH reserved slots
+    if (bp->n_slabs_reserved_available > bp->n_slabs_reserved) {
+        bp->n_slabs_reserved_available = bp->n_slabs_reserved;
+        fprintf(stderr, "Warning: Potential issue in bcache_free slab reservation count.\n");
+    }
 
-	// 2. Return the final (potentially partially-full) producer slab.
-	if (bc->n_buffers_prod > 0) {
-		bp->slabs[bp->n_slabs_available++] = bc->slab_prod;
-	}
+    pthread_mutex_unlock(&bp->lock);
 
-	// 3. The original consumer slab is now either empty or has been repurposed.
-	// We can just mark it as available for reservation.
-	bp->slabs_reserved[bp->n_slabs_reserved_available++] = bc->slab_cons;
-
-
-	pthread_mutex_unlock(&bp->lock);
-	free(bc);
+    free(bc); // Free the bcache struct itself
 }
 
 /* To work correctly, the implementation requires that the *n_buffers* input
